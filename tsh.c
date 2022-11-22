@@ -190,60 +190,82 @@ void eval(const char *cmdline) {
     // receive "job"
     if (token.builtin == BUILTIN_JOBS) {
         sigprocmask(SIG_BLOCK, &mask, &prev);
-        list_jobs(STDOUT_FILENO);
+        if (!list_jobs(STDOUT_FILENO)) {
+            printf("An error ocurred while writing to the file descriptor\n");
+        };
         sigprocmask(SIG_SETMASK, &prev, NULL);
         return;
     }
     // receive "bg" or "fg"
     if (token.builtin == BUILTIN_BG || token.builtin == BUILTIN_FG) {
         sigprocmask(SIG_BLOCK, &mask, &prev);
-        char *next = token.argv[1];
+        char* next = token.argv[1];
         pid_t thisPID;
         // Empty after bg or fg
         if (next == NULL) {
-            printf("No PID or JID provided\n");
             sigprocmask(SIG_SETMASK, &prev, NULL);
+            if (token.builtin == BUILTIN_BG) {
+                printf("bg command requires PID or %%jobid argument\n");
+            } else {
+                printf("fg command requires PID or %%jobid argument\n");
+            }
             return;
         }
         // JID Provided
         if (next[0] == '%') {
-            char *start = next + 1;
-            char **end = NULL;
-            jid_t parsedJID = (jid_t)strtol(start, end, 10);
+            char* start = next + 1;
+            char** end = NULL;
+            jid_t parsedJID = (jid_t) strtol(start, end, 10);
             // check if the given JID exists.
             if (!job_exists(parsedJID)) {
-                printf("This job does not exist\n");
+                printf("%%%d: No such job\n", parsedJID);
                 sigprocmask(SIG_SETMASK, &prev, NULL);
                 return;
             }
             thisPID = job_get_pid(parsedJID);
-            // pid provided
+        // pid provided
         } else if (next[0] >= '0' && next[0] <= '9') {
-            char *start = next;
-            char **end = NULL;
-            pid_t parsedPID = (pid_t)strtol(start, end, 10);
+            char* start = next;
+            char** end = NULL;
+            pid_t parsedPID = (pid_t) strtol(start, end, 10);
             jid_t corJID = job_from_pid(parsedPID);
-            if (corJID == 0) {
-                printf("This job does not exist\n");
+            if (corJID  == 0) {
+                printf("No such job\n");
                 sigprocmask(SIG_SETMASK, &prev, NULL);
                 return;
             }
             thisPID = parsedPID;
-            // not a % (jid) or a number (pid), must be invalid.
+        // not a % (jid) or a number (pid), must be invalid.
         } else {
-            printf("Invalid argument\n");
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            if (token.builtin == BUILTIN_BG) {
+                printf("bg: argument must be a PID or %%jobid\n");
+
+            } else {
+                printf("fg: argument must be a PID or %%jobid\n");
+
+            }
             return;
         }
-        // process the parsed JID/PID.
-        jid_t thisJID = job_from_pid(thisPID);
-        kill(-thisPID, SIGCONT);
+        jid_t thisJID = job_from_pid(thisPID); 
+        // If the continued job is background, change its state and print     
         if (token.builtin == BUILTIN_BG) {
-            job_set_state(thisJID, BUILTIN_BG);
+            job_set_state(thisJID, BG);
+            if (kill(-thisPID, SIGCONT) == -1) {
+                printf("Failed to send signal\n");
+                return;
+            }
+            const char* jobcmd = job_get_cmdline(thisJID);
             sigprocmask(SIG_SETMASK, &prev, NULL);
-            printf("[%d] (%d) %s\n", thisJID, thisPID, cmdline);
+            printf("[%d] (%d) %s\n", thisJID, thisPID, jobcmd);
             return;
+        // If the continued job is foreground, change its state and wait for it to finish
         } else {
-            job_set_state(thisJID, BUILTIN_FG);
+            job_set_state(thisJID, FG);
+            if (kill(-thisPID, SIGCONT) == -1) {
+                printf("Failed to send signal\n");
+                return;
+            }
             while (fg_job() == thisJID) {
                 sigsuspend(&prev);
             }
@@ -252,32 +274,28 @@ void eval(const char *cmdline) {
         }
     }
     // If the codes reach here, the command is not builtin command.
-    sigset_t sigchldmask;
-    sigemptyset(&sigchldmask);
-    sigaddset(&sigchldmask, SIGCHLD);
     sigemptyset(&empty);
     pid_t pid;
-    sigprocmask(SIG_BLOCK, &sigchldmask, &prev);
+    // Has to block all signals here instead of only blocking SIGCHLD, or race condition will occur if send SIGINT or SIGTSTP to the fg job.
+    sigprocmask(SIG_BLOCK, &mask, &prev);
     if ((pid = fork()) == 0) {
         sigprocmask(SIG_SETMASK, &prev, NULL);
         setpgid(0, 0);
-        if (execve(token.argv[0], token.argv, environ) < 0) {
+        if (execve(token.argv[0], token.argv, environ) < 0) { 
             printf("execve failed\n");
             return;
         }
     }
-
     if (parse_result == PARSELINE_FG) {
-        sigprocmask(SIG_BLOCK, &mask, NULL);
         add_job(pid, FG, cmdline);
         jid_t jid = job_from_pid(pid);
-        while (fg_job() == jid) {
+        while(fg_job() == jid) {
             sigsuspend(&prev);
         }
         sigprocmask(SIG_SETMASK, &prev, NULL);
 
-    } else if (parse_result == PARSELINE_BG) {
-        sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    } else if (parse_result == PARSELINE_BG){
         add_job(pid, BG, cmdline);
         jid_t jid = job_from_pid(pid);
         sigprocmask(SIG_SETMASK, &prev, NULL);
@@ -303,27 +321,32 @@ void sigchld_handler(int sig) {
     int status;
     sigfillset(&mask);
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        // A child is terminated normally
         if (WIFEXITED(status)) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
+            if (verbose) {
+                sio_printf("Job [%d] (%d) terminated normally (status %d)\n", deletedJob, pid, WEXITSTATUS(status));
+            }
             delete_job(deletedJob);
             sigprocmask(SIG_SETMASK, &prev, NULL);
+        // A child is terminated by a signal(SIGINT)
         } else if (WIFSIGNALED(status)) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
             int termSignal = WTERMSIG(status);
-            sio_printf("Job [%d] (%d) terminated by signal %d\n", deletedJob,
-                       pid, termSignal);
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", deletedJob, pid, termSignal);
             delete_job(deletedJob);
             sigprocmask(SIG_SETMASK, &prev, NULL);
+        // A child is stopped by receving SIGTSTP
         } else if (WIFSTOPPED(status)) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t stoppedJob = job_from_pid(pid);
             int stopSignal = WSTOPSIG(status);
-            sio_printf("Job [%d] (%d) stopped by signal %d\n", stoppedJob, pid,
-                       stopSignal);
+            sio_printf("Job [%d] (%d) stopped by signal %d\n", stoppedJob, pid, stopSignal);
             job_set_state(stoppedJob, ST);
             sigprocmask(SIG_SETMASK, &prev, NULL);
+        // Other cases
         } else {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
