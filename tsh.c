@@ -2,11 +2,44 @@
  * @file tsh.c
  * @brief A tiny shell program with job control
  *
- * TODO: Delete this comment and replace it with your own.
- * <The line above is not a sufficient documentation.
- *  You will need to write your program documentation.
- *  Follow the 15-213/18-213/15-513 style guide at
- *  http://www.cs.cmu.edu/~213/codeStyle.html.>
+ * This .c file is an implementation of a Linux shell program called tiny shell
+ * (tsh). This shell support limited features such as built-in command
+ * operation, foreground/background job control and management, and Input/Output
+ * redirection.
+ *
+ * The user can use this shell as a normal shell (such as bash) to run jobs.
+ * There are two types of jobs that tsh supports, a foreground job and a
+ * background job. A job is recognized as a foreground job by default. It means
+ * that until this job process is terminated or stopped, the shell will not be
+ * ready for the next command. The user can also run a job in the background by
+ * adding a "&" to the end of the command line.
+ *
+ * The command line can be divided into two types, the built-in command and the
+ * non-built-in command. For the built-in commands, there are four commands that
+ * tsh support. "quit": The shell will terminate "jobs" the shell will print out
+ * a list of all current background jobs. "bg (PID)" or bg (%JID): The shell
+ * will resume this job and run it as a background job. "fg (PID)" or fg (%JID):
+ * The shell will resume this job and run it as a foreground job.
+ *
+ * If the given command line is not parsed as a built-in command, then the shell
+ * will run the input job either in foreground or in background as the user's
+ * request. The shell is also able to reap all the terminated or changed state
+ * children. The signal handler for SIGINT will do all the jobs without waiting
+ * for child termination. As the foreground job runs, the user can send two
+ * signals to the foreground job, SIGINT and SIGTSTP. By typing CRTL+C, the user
+ * can send a SIGINT to the entire process group that contains the foreground
+ * job. The job will terminate when it receives this signal, and this job will
+ * be removed from the job list. By typing CRTL+Z, the user can send a SIGTSTP
+ * to the entire process group that contains the foreground job. The job will be
+ * stopped when it receives this signal. The user can resume this job by using
+ * the built-in command bg/fg (PID)/(%JID).
+ *
+ * The shell also supports input and output redirection.
+ * If the user want to change the output destination from stdout to a file, the
+ * character > followed by a location can be used to alter the source of the
+ * output. If the user want to change the input destination from stdin to a
+ * file, the character < followed by a location can be used to alter the source
+ * of the input.
  *
  * @author Taichen Ling <taichenl@andrew.cmu.edu>
  */
@@ -160,9 +193,23 @@ int main(int argc, char **argv) {
 }
 
 /**
- * @brief <What does eval do?>
+ * @brief eval is the main routine that parse, translate, and process the
+ * command line arguments.
  *
- * TODO: Delete this comment and replace it with your own.
+ * The function "eval" can be divided into two main parts, built-in command
+ * handling, and non-built-in command handling. Firstly the function will
+ * evaluate the validity of the command line input. If it is an invalid line or
+ * line with errors, it will do nothing and return. Then it will evaluate the
+ * command line and see if it is one of the four built-in commands. -If it is
+ * the built-in command "quit," then the shell will terminate by calling exit(0)
+ * -If it is the built-in command "jobs," the shell will print out a list of all
+ * current background jobs. -If it is the built-in command "bg," followed by a
+ * PID or a JID, the shell will resume this job by sending a SIGCONT signal and
+ * run this job as a background job. -If it is the built-in command "fg,"
+ * followed by a PID or a JID, the shell will resume this job by sending a
+ * SIGCONT signal and run this job as a background job. If it is non of the
+ * cases above, the shell will fork a child to run the provided job from the
+ * command line.
  *
  * NOTE: The shell is supposed to be a long-running process, so this function
  *       (and its helpers) should avoid exiting on error.  This is not to say
@@ -187,19 +234,34 @@ void eval(const char *cmdline) {
     if (token.builtin == BUILTIN_QUIT) {
         exit(0);
     }
-    // receive "job"
+    // receive "jobs"
     if (token.builtin == BUILTIN_JOBS) {
         sigprocmask(SIG_BLOCK, &mask, &prev);
-        if (!list_jobs(STDOUT_FILENO)) {
-            printf("An error ocurred while writing to the file descriptor\n");
-        };
+        if (token.outfile != NULL) {
+            int fd = open(token.outfile, O_WRONLY | O_CREAT, 0666);
+            if (fd < 0) {
+                printf("%s\n", strerror(errno));
+                return;
+            }
+            dup2(STDOUT_FILENO, fd);
+            if (!list_jobs(fd)) {
+                printf(
+                    "An error occured while writing to the file descriptor\n");
+            }
+        } else {
+            if (!list_jobs(STDOUT_FILENO)) {
+                printf(
+                    "An error ocurred while writing to the file descriptor\n");
+            }
+        }
+
         sigprocmask(SIG_SETMASK, &prev, NULL);
         return;
     }
     // receive "bg" or "fg"
     if (token.builtin == BUILTIN_BG || token.builtin == BUILTIN_FG) {
         sigprocmask(SIG_BLOCK, &mask, &prev);
-        char* next = token.argv[1];
+        char *next = token.argv[1];
         pid_t thisPID;
         // Empty after bg or fg
         if (next == NULL) {
@@ -213,9 +275,9 @@ void eval(const char *cmdline) {
         }
         // JID Provided
         if (next[0] == '%') {
-            char* start = next + 1;
-            char** end = NULL;
-            jid_t parsedJID = (jid_t) strtol(start, end, 10);
+            char *start = next + 1;
+            char **end = NULL;
+            jid_t parsedJID = (jid_t)strtol(start, end, 10);
             // check if the given JID exists.
             if (!job_exists(parsedJID)) {
                 printf("%%%d: No such job\n", parsedJID);
@@ -223,19 +285,19 @@ void eval(const char *cmdline) {
                 return;
             }
             thisPID = job_get_pid(parsedJID);
-        // pid provided
+            // pid provided
         } else if (next[0] >= '0' && next[0] <= '9') {
-            char* start = next;
-            char** end = NULL;
-            pid_t parsedPID = (pid_t) strtol(start, end, 10);
+            char *start = next;
+            char **end = NULL;
+            pid_t parsedPID = (pid_t)strtol(start, end, 10);
             jid_t corJID = job_from_pid(parsedPID);
-            if (corJID  == 0) {
+            if (corJID == 0) {
                 printf("No such job\n");
                 sigprocmask(SIG_SETMASK, &prev, NULL);
                 return;
             }
             thisPID = parsedPID;
-        // not a % (jid) or a number (pid), must be invalid.
+            // not a % (jid) or a number (pid), must be invalid.
         } else {
             sigprocmask(SIG_SETMASK, &prev, NULL);
             if (token.builtin == BUILTIN_BG) {
@@ -243,23 +305,23 @@ void eval(const char *cmdline) {
 
             } else {
                 printf("fg: argument must be a PID or %%jobid\n");
-
             }
             return;
         }
-        jid_t thisJID = job_from_pid(thisPID); 
-        // If the continued job is background, change its state and print     
+        jid_t thisJID = job_from_pid(thisPID);
+        // If the continued job is background, change its state and print
         if (token.builtin == BUILTIN_BG) {
             job_set_state(thisJID, BG);
             if (kill(-thisPID, SIGCONT) == -1) {
                 printf("Failed to send signal\n");
                 return;
             }
-            const char* jobcmd = job_get_cmdline(thisJID);
+            const char *jobcmd = job_get_cmdline(thisJID);
             sigprocmask(SIG_SETMASK, &prev, NULL);
             printf("[%d] (%d) %s\n", thisJID, thisPID, jobcmd);
             return;
-        // If the continued job is foreground, change its state and wait for it to finish
+            // If the continued job is foreground, change its state and wait for
+            // it to finish
         } else {
             job_set_state(thisJID, FG);
             if (kill(-thisPID, SIGCONT) == -1) {
@@ -276,26 +338,63 @@ void eval(const char *cmdline) {
     // If the codes reach here, the command is not builtin command.
     sigemptyset(&empty);
     pid_t pid;
-    // Has to block all signals here instead of only blocking SIGCHLD, or race condition will occur if send SIGINT or SIGTSTP to the fg job.
+    // Has to block all signals here instead of only blocking SIGCHLD, or race
+    // condition will occur if send SIGINT or SIGTSTP to the fg job.
     sigprocmask(SIG_BLOCK, &mask, &prev);
     if ((pid = fork()) == 0) {
         sigprocmask(SIG_SETMASK, &prev, NULL);
         setpgid(0, 0);
-        if (execve(token.argv[0], token.argv, environ) < 0) { 
-            printf("execve failed\n");
-            return;
+        // If output file is given, do output redirection
+        if (token.infile == NULL && token.outfile != NULL) {
+            int fd = open(token.outfile, O_WRONLY | O_CREAT, 0666);
+            dup2(STDOUT_FILENO, fd);
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                printf("execve failed\n");
+                return;
+            }
+            // If input file is given, do input redirection
+        } else if (token.infile != NULL && token.outfile == NULL) {
+            int fd = open(token.infile, O_RDONLY, 0);
+            if (fd < 0) {
+                printf("%s: %s\n", token.infile, strerror(errno));
+                exit(1);
+            }
+            dup2(fd, STDIN_FILENO);
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                printf("execve failed\n");
+                return;
+            }
+            // If both input and output files are given, do redirection.
+        } else if (token.infile != NULL && token.outfile != NULL) {
+            int fdin = open(token.infile, O_RDONLY, 0);
+            int fdout = open(token.outfile, O_WRONLY | O_CREAT, 0666);
+            if (fdin < 0) {
+                printf("%s: %s\n", token.infile, strerror(errno));
+                exit(1);
+            }
+            dup2(fdin, STDIN_FILENO);
+            dup2(STDOUT_FILENO, fdout);
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                printf("execve failed\n");
+                return;
+            }
+            // No I/O file given, do STDIN and STDOUT.
+        } else {
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                printf("execve failed\n");
+                return;
+            }
         }
     }
     if (parse_result == PARSELINE_FG) {
         add_job(pid, FG, cmdline);
         jid_t jid = job_from_pid(pid);
-        while(fg_job() == jid) {
+        while (fg_job() == jid) {
             sigsuspend(&prev);
         }
         sigprocmask(SIG_SETMASK, &prev, NULL);
 
-
-    } else if (parse_result == PARSELINE_BG){
+    } else if (parse_result == PARSELINE_BG) {
         add_job(pid, BG, cmdline);
         jid_t jid = job_from_pid(pid);
         sigprocmask(SIG_SETMASK, &prev, NULL);
@@ -309,9 +408,21 @@ void eval(const char *cmdline) {
  *****************/
 
 /**
- * @brief <What does sigchld_handler do?>
+ * @brief sigchld_hander will handle the SIGCHLD signal. When the process
+ * receive SIGCHLD, this handler will trigger.
  *
- * TODO: Delete this comment and replace it with your own.
+ * TODO: This function will trigger every time the process receives a SIGCHLD
+ * signal. It reaps or change the state of child processes. The waitpid function
+ * will not suspends execution of the calling process by passing in WNOHANG. It
+ * will return the pid of the reaped process or value 0 immediately. The waitpid
+ * function will also return when a child process becomes stopped by passing in
+ * WUNTRACED. After the function got a pid return, it will check the status. If
+ * WIFEXITED(status), means the child process terminated normally. The job will
+ * be deleted from the job list If WIFSIGNALED(status), means the child process
+ * is terminated by a signal. THe job will be deleted from the job list, and
+ * print a message indicating this. If WIFSTOPPED(status), means that the child
+ * process is stopped for some reason. This job's state will be set to ST
+ * (stop), and print a message indicating this.
  */
 void sigchld_handler(int sig) {
     int olderrno = errno;
@@ -326,27 +437,30 @@ void sigchld_handler(int sig) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
             if (verbose) {
-                sio_printf("Job [%d] (%d) terminated normally (status %d)\n", deletedJob, pid, WEXITSTATUS(status));
+                sio_printf("Job [%d] (%d) terminated normally (status %d)\n",
+                           deletedJob, pid, WEXITSTATUS(status));
             }
             delete_job(deletedJob);
             sigprocmask(SIG_SETMASK, &prev, NULL);
-        // A child is terminated by a signal(SIGINT)
+            // A child is terminated by a signal(SIGINT)
         } else if (WIFSIGNALED(status)) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
             int termSignal = WTERMSIG(status);
-            sio_printf("Job [%d] (%d) terminated by signal %d\n", deletedJob, pid, termSignal);
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", deletedJob,
+                       pid, termSignal);
             delete_job(deletedJob);
             sigprocmask(SIG_SETMASK, &prev, NULL);
-        // A child is stopped by receving SIGTSTP
+            // A child is stopped by receving SIGTSTP
         } else if (WIFSTOPPED(status)) {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t stoppedJob = job_from_pid(pid);
             int stopSignal = WSTOPSIG(status);
-            sio_printf("Job [%d] (%d) stopped by signal %d\n", stoppedJob, pid, stopSignal);
+            sio_printf("Job [%d] (%d) stopped by signal %d\n", stoppedJob, pid,
+                       stopSignal);
             job_set_state(stoppedJob, ST);
             sigprocmask(SIG_SETMASK, &prev, NULL);
-        // Other cases
+            // Other cases
         } else {
             sigprocmask(SIG_BLOCK, &mask, &prev);
             jid_t deletedJob = job_from_pid(pid);
@@ -358,9 +472,11 @@ void sigchld_handler(int sig) {
 }
 
 /**
- * @brief <What does sigint_handler do?>
+ * @brief sigint_hander will handle the SIGINT signal. When the process receive
+ * SIGINT, this handler will trigger.
  *
- * TODO: Delete this comment and replace it with your own.
+ * TODO: This function will trigger every time the process receives a SIGINT
+ * signal. The handler will send the signal to the foreground job.
  */
 void sigint_handler(int sig) {
     int olderrno = errno;
@@ -371,18 +487,19 @@ void sigint_handler(int sig) {
     jid_t fgjid = fg_job();
     if (fgjid != 0) {
         pid_t fgpid = job_get_pid(fgjid);
-        if (kill(-fgpid, sig) == -1) {
-            sio_printf("Failed to send signal\n");
-        }
+        kill(-fgpid, sig);
     }
     sigprocmask(SIG_SETMASK, &prev, NULL);
     errno = olderrno;
 }
 
 /**
- * @brief <What does sigtstp_handler do?>
+ * @brief sigtstp_hander will handle the SIGTSTP signal. When the process
+ * receive SIGTSTP, this handler will trigger.
  *
- * TODO: Delete this comment and replace it with your own.
+ * This function will trigger every time the process receives a SIGTSTP signal.
+ * The handler will send the signal to the foreground job.
+ *
  */
 void sigtstp_handler(int sig) {
     int olderrno = errno;
@@ -393,9 +510,7 @@ void sigtstp_handler(int sig) {
     jid_t fgjid = fg_job();
     if (fgjid != 0) {
         pid_t fgpid = job_get_pid(fgjid);
-        if (kill(-fgpid, sig) == -1) {
-            sio_printf("Failed to send signal\n");
-        }
+        kill(-fgpid, sig);
     }
     sigprocmask(SIG_SETMASK, &prev, NULL);
     errno = olderrno;
